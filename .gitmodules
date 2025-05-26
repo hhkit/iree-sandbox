@@ -1,0 +1,3 @@
+[submodule "deps/models"]
+	path = deps/models
+	url = https://github.com/onnx/models
