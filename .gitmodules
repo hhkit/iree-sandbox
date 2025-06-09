@@ -1,3 +1,6 @@
 [submodule "deps/models"]
 	path = deps/models
 	url = https://github.com/onnx/models
+[submodule "deps/iree-test-suites"]
+	path = deps/iree-test-suites
+	url = https://github.com/iree-org/iree-test-suites/
