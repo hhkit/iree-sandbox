@@ -18,7 +18,7 @@ class FlashAttention(torch.nn.Module):
 
         o = torch.zeros(q.shape, dtype=torch.float16)
         l = torch.zeros((N), dtype=torch.float16)
-        m = torch.fill(torch.empty((N), dtype=torch.float16), -math.inf)
+        m = torch.full((N,), -math.inf, dtype=torch.float16)
 
         T_r = int(math.ceil(float(N) / B_r))
         T_c = int(math.ceil(float(N) / B_c))
@@ -42,8 +42,6 @@ class FlashAttention(torch.nn.Module):
 
             # for (q_i, o_i, l_i, m_i) in zip(q_blocks, o_blocks, l_blocks, m_blocks):
             for i in range(T_r):
-                print(f"{i}x{j}")
-
                 q_i = q_blocks[i]
                 o_i = o_blocks[i]
                 l_i = l_blocks[i]
