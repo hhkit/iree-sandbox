@@ -99,7 +99,25 @@ def matmul_kernel(
     B_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    # q: how many threads are launched?
+    # "triton is a block-programming language", "triton is lower level than torch, but higher level than cuda"
+    #  -> "torch is a tensor programming language"
+    #        the nice part about torch is that we can do all our operations in terms of tensors
+    #        the mathematics works out fairly nicely
+    #        but we have no control over the blocking
+    #  -> CUDA is a low-level language
+    #        we can directly address each thread and group in CUDA, gid = bid * B + tid, etc.
+    #        but we have to address each operation per-element
+    #  hence, triton allows us
+    #        - control over thread and group while
+    #        - performing tensor computations
+    # therefore, questions:
+    #        - what computations are done cooperatively? is that a meaningful question to ask at this level of abstraction?
+    #            - all computations done using pid can be statically tracked and fused into SIMD)
+    #        - what is GROUP_SIZE_M and BLOCK_SIZE_M in this matmul example? rather, why do we have GROUP_SIZE_M?
+
+    pid = tl.program_id(axis=0) # why axis=0, why don't we use the other axes?
+                                # probably cause we're doing split-K
 
     T_M = tl.cdiv(M, B_M)
     T_N = tl.cdiv(N, B_N)
@@ -123,6 +141,11 @@ def matmul_kernel(
     # b_ptrs is a tensor of [B_K, B_N] ptrs
 
     # for a tensor arr with shape (a), arr[:, None] broadcasts to a shape (a, 1)
+    # therefore, the shape arithmetic is:
+    #     a_ptrs = [1] + ([B_M, 1] * [1] + [1, B_K] * [1])
+    #            = [1] + ([B_M, 1]       + [1, B_K])
+    #            = [1] + ([B_M, B_K])
+    #            = [B_M, B_K]
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak) # [B_M, B_K]
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn) # [B_K, B_N]
 
@@ -133,6 +156,11 @@ def matmul_kernel(
 
         # load tensors
         # q: are these cooperative loads?
+        # q: another way: what is the total memory put into SRAM with each load?
+        #    is it [B_M, B_K]? or is it [B_M, B_K] per pid?
+        #    that is, the total elems loaded per thread block is [B_M, B_K] * group_size?
+        #
+        #    this is the main blocking question for reimplementing FA2 in triton
         a = tl.load(a_ptrs, mask=offs_k[None, :] < max_k, other=0.0) 
         b = tl.load(b_ptrs, mask=offs_k[:, None] < max_k, other=0.0)
 
