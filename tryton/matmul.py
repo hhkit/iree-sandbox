@@ -150,7 +150,7 @@ def matmul_kernel(
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn) # [B_K, B_N]
 
     acc = tl.zeros((B_M, B_N), dtype=tl.float32)
-    for k in range(0, T_K):
+    for k in tl.range(0, T_K):
         # offsets move forward by B_K every iter, so max_k reduces by B_K every iter
         max_k = K - k * B_K 
 
