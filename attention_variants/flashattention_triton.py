@@ -15,7 +15,14 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) ->  torch.Tenso
     return tl.softmax(q @ k.T) @ v
 
 @triton.jit
-def flashattention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def flash_attention_kernel( q: torch.Tensor, 
+                            k: torch.Tensor, 
+                            v: torch.Tensor,
+                            o: torch.Tensor,
+                            o_prev: torch.Tensor,
+                            l_prev: torch.Tensor,
+                            m_prev: torch.Tensor,
+                            ) -> torch.Tensor:
     N,d = q.shape
     B_c = int(math.ceil(float(M) / (4 * d)))
     B_r = int(min(B_c, d))
@@ -23,44 +30,45 @@ def flashattention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
     T_c = int(math.ceil(float(N) / B_c))
 
     pid = tl.program_id(axis=0)
-
-    o = tl.zeros(q.shape, dtype=tl.float16)
-    l = tl.zeros((N), dtype=tl.float16)
-    m = tl.full((N,), -math.inf, dtype=tl.float16)
     
-    for j in tl.range(0, N, B_c):
-        k_j = tl.load(k[j : j + B_c, :]).T
-        v_j = tl.load(v[j : j + B_c, :])
+    for i in tl.range(0, N, B_r):
+        offsets = tl.arange(0, B_r)
+        q_i = tl.load(q + offsets)
+        o_i = tl.load(o + offsets)
 
-        for i in tl.range(0, N, B_r):
-            q_i = tl.load(q[i : i + B_r, :])
-            o_i = tl.load(o[i : i + B_r, :])
-            l_i = tl.load(l[i : i + B_r, :])
-            m_i = tl.load(m[i : i + B_r, :])
+        o_prev = torch.zeros((B_r, d), dtype=torch.float16)
+        l_prev = tl.zeros((B_r), dtype=torch.float16)
+        m_prev = tl.zeros((B_r, 1), -math.inf, dtype=torch.float16) - math.inf
 
-            s = q_i @ k_j
-            m_ij_tilde, _ = s_block.max(dim=-1, keepdim=True)
-            p_ij_tilde = torch.exp(s_block - m_ij_tilde)
-            l_ij_tilde = torch.sum(p_ij_tilde, dim=-1, keepdim=True)
+        # online softmax
+        for j in tl.range(0, N, B_c):
+            k_j = k_blocks[j]
+            v_j = v_blocks[j]
 
-            m_i_new = m_i.max(m_ij_tilde)
-            m_sub_mnew = torch.exp(m_i - m_i_new)
-            m_tilde_sub_mnew = torch.exp(m_ij_tilde - m_i_new)
+            s_i = q_i @ k_j.T
+            m_tilde, _ = tl.max(s_i, dim=-1, keepdim=True)
+            m_i = tl.maximum(m_prev, m_tilde)
+            p_i = tl.exp(s_i - m_i)
+            ex_m_diff = tl.exp(m_prev - m_i)
+            l_i = ex_m_diff * l_prev + tl.sum(p_i, dim=-1, keepdim=True)
+            o_i = ex_m_diff * o_prev + p_i @ v_j
 
-            l_i_new = m_sub_mnew * l_i + m_tilde_sub_mnew * l_ij_tilde
+            m_prev = m_i
+            l_prev = l_i
+            o_prev = o_i
 
-            lexpr = ((l_i / l_i_new) * torch.exp(m_i - m_i_new) @ o_i)
-            rexpr = (torch.exp(m_ij_tilde - m_i_new) /
-                        l_i_new) @ (p_ij_tilde @ v_j)
-            o_blocks[i] = lexpr + rexpr
-            l_blocks[i] = l_i_new
-            m_blocks[i] = m_i_new
-
-            tl.store()
+        tl.store(o + offsets, o_i / l_prev)
+        tl.store(l + offsets, m_prev + tl.log(l_prev))
 
     return q
 
-@triton.jit
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    o = tl.zeros(q.shape, dtype=q.dtype)
+    o_prev = torch.zeros((B_r, d), dtype=torch.float16)
+    l_prev = torch.zeros((B_r), dtype=torch.float16)
+    m_prev = torch.full((B_r, 1), -math.inf, dtype=torch.float16)
+    return o
+
 def main():
     seq_len = 1024
     head_dim = 128
