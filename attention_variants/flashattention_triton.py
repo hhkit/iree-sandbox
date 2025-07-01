@@ -23,7 +23,9 @@ def torch_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
 def get_autotune_config():
     return [
         triton.Config({'B_c': 16, 'B_r': 16, 'd': 128}),
-        triton.Config({'B_c': 16, 'B_r': 8, 'd': 128}),
+        triton.Config({'B_c': 16, 'B_r': 32, 'd': 128}),
+        triton.Config({'B_c': 32, 'B_r': 16, 'd': 128}),
+        triton.Config({'B_c': 32, 'B_r': 32, 'd': 128}),
     ]
 
 @triton.jit 
@@ -67,9 +69,9 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     q_i = tl.load(q_ptrs, mask=off_r[:, None] < N, other=0.0)   # q_i   has shape [B_r, d]
 
     ## 5: on-chip, initialize o_prev_i, l_prev_i, m_prev_i
-    o_prev = tl.zeros((B_r, d), dtype=tl.float32)             # 5: o(0)_i has 0s    of shape [B_r, d]
-    l_prev = tl.zeros((B_r, 1), dtype=tl.float32)             # 5: l(0)_i has 0s    of shape [B_r]
-    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
+    o_prev = tl.zeros((B_r, d), dtype=tl.float16)             # 5: o(0)_i has 0s    of shape [B_r, d]
+    l_prev = tl.zeros((B_r, 1), dtype=tl.float16)             # 5: l(0)_i has 0s    of shape [B_r]
+    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float16)   # 5: m(0)_i has -infs of shape [B_r]
     
     # online softmax
     ## 6: for 1 <= j <= T_c do
@@ -81,16 +83,16 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
         v_j = tl.load(v_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load V_j from HBM to on-chip SRAM. V_j has shape [B_c, d]
 
         # there is no matmul op in triton
-        s_i = tl.dot(q_i, k_j.T)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
+        s_i = tl.dot(q_i, k_j.T, out_dtype=tl.float16)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
         m_tilde = tl.max(s_i, axis=-1, keep_dims=True)                   ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
         m_i = tl.maximum(m_prev, m_tilde)                                               
-        p_i = tl.exp(s_i - m_i)                                          ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
-        ex_m_diff = tl.exp(m_prev - m_i)
+        p_i = tl.exp(s_i - m_i).to(tl.float16)                           ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
+        ex_m_diff = tl.exp(m_prev - m_i).to(tl.float16)
         
         l_i = ex_m_diff * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)  ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
-        o_i = ex_m_diff * o_prev + tl.dot(p_i, v_j)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i ) + P(j)_i @ V_j )     }$ of shape [B_r, d]
+        o_i = ex_m_diff * o_prev + tl.dot(p_i, v_j, out_dtype=tl.float16)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i ) + P(j)_i @ V_j )     }$ of shape [B_r, d]
 
-        m_prev = m_i
+        m_prev = m_i.to(tl.float16)
         l_prev = l_i
         o_prev = o_i
 
@@ -123,9 +125,9 @@ def main():
     seq_len = 1024
     head_dim = 128
 
-    q = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
-    k = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
-    v = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
+    q = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
+    v = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
 
     flash_output = flash_attention(q,k,v)
     torch_output = torch_attention(q,k,v)
@@ -135,12 +137,15 @@ def main():
         print("✅ Flash and Base match")
     else:
         print("❌ Flash and Base differ")
-        df = pandas.DataFrame(flash_output.cpu().numpy())
-        df.to_csv('flash.csv')
-        df = pandas.DataFrame(torch_output.cpu().numpy())
-        df.to_csv('torch.csv')
-        df = pandas.DataFrame(torch_flash_output.cpu().numpy())
-        df.to_csv('torch_flash.csv')
+        to_csv = lambda tensor, csv : pandas.DataFrame(tensor.cpu().numpy()).to_csv(csv)
+
+        to_csv(flash_output, 'flash.csv')
+        to_csv(torch_output, 'torch.csv')
+        to_csv(torch_flash_output, 'torch_flash.csv')
+
+        diff = (flash_output - torch_output) / torch_output
+        to_csv(diff, 'diff.csv')
+
         # torch.save(flash_output, 'flash.pt')
         # torch.save(base_output, 'base.pt')
 
