@@ -59,7 +59,7 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     # This code is as per Algorithm 1 in Flash Attention 2: https://arxiv.org/pdf/2307.08691
     ##  3: for 1 <= i <= T_r do
     off_r = (pid * B_r + tl.arange(0, B_r)) % N      # off_r has shape [B_r]
-    off_c = (pid * B_c + tl.arange(0, B_c)) % N      # off_c has shape [B_c]
+    off_c = tl.arange(0, B_c)                        # off_c has shape [B_c]
     off_d = tl.arange(0, d)                          # off_d has shape [d]
 
     q_ptrs = q_ptr + (off_r[:, None] * stride_qn + off_d[None, :] * stride_qd)
@@ -69,9 +69,9 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     q_i = tl.load(q_ptrs, mask=off_r[:, None] < N, other=0.0)   # q_i   has shape [B_r, d]
 
     ## 5: on-chip, initialize o_prev_i, l_prev_i, m_prev_i
-    o_prev = tl.zeros((B_r, d), dtype=tl.float16)             # 5: o(0)_i has 0s    of shape [B_r, d]
-    l_prev = tl.zeros((B_r, 1), dtype=tl.float16)             # 5: l(0)_i has 0s    of shape [B_r]
-    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float16)   # 5: m(0)_i has -infs of shape [B_r]
+    o_prev = tl.zeros((B_r, d), dtype=tl.float32)             # 5: o(0)_i has 0s    of shape [B_r, d]
+    l_prev = tl.zeros((B_r, 1), dtype=tl.float32)             # 5: l(0)_i has 0s    of shape [B_r]
+    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
     
     # online softmax
     ## 6: for 1 <= j <= T_c do
@@ -83,16 +83,15 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
         v_j = tl.load(v_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load V_j from HBM to on-chip SRAM. V_j has shape [B_c, d]
 
         # there is no matmul op in triton
-        s_i = tl.dot(q_i, k_j.T, out_dtype=tl.float16)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
-        m_tilde = tl.max(s_i, axis=-1, keep_dims=True)                   ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
-        m_i = tl.maximum(m_prev, m_tilde)                                               
-        p_i = tl.exp(s_i - m_i).to(tl.float16)                           ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
-        ex_m_diff = tl.exp(m_prev - m_i).to(tl.float16)
+        s_i = tl.dot(q_i, k_j.T)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
+        m_i = tl.maximum(m_prev, tl.max(s_i, axis=-1, keep_dims=True))   ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
+        p_i = tl.exp(s_i - m_i)                                          ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
         
-        l_i = ex_m_diff * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)  ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
-        o_i = ex_m_diff * o_prev + tl.dot(p_i, v_j, out_dtype=tl.float16)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i ) + P(j)_i @ V_j )     }$ of shape [B_r, d]
+        alpha = tl.exp(m_prev - m_i)
+        l_i = alpha * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)  ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
+        o_i = tl.dot(p_i, v_j, alpha * o_prev)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i )-1 + P(j)_i @ V_j )     }$ of shape [B_r, d]
 
-        m_prev = m_i.to(tl.float16)
+        m_prev = m_i
         l_prev = l_i
         o_prev = o_i
 
@@ -125,9 +124,9 @@ def main():
     seq_len = 1024
     head_dim = 128
 
-    q = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
-    k = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
-    v = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float16)
+    q = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
+    k = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
+    v = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
 
     flash_output = flash_attention(q,k,v)
     torch_output = torch_attention(q,k,v)
@@ -144,7 +143,11 @@ def main():
         to_csv(torch_flash_output, 'torch_flash.csv')
 
         diff = (flash_output - torch_output) / torch_output
-        to_csv(diff, 'diff.csv')
+        threshold = 0.1
+        mask = torch.abs(diff) < threshold
+        zeros = torch.zeros_like(diff)
+        zeros[~mask] = diff[~mask]
+        to_csv(zeros, 'diff.csv')
 
         # torch.save(flash_output, 'flash.pt')
         # torch.save(base_output, 'base.pt')
