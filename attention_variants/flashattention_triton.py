@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 import torch
 import torch.nn as nn
+import numpy 
+import pandas
 
 import iree.turbine.aot as aot
 import iree.runtime as rt
@@ -12,12 +14,16 @@ M = int(262144)
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+def torch_flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.scaled_dot_product_attention(q,k,v)
+
 def torch_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.softmax(q @ k.T, dim=-1) @ v
 
 def get_autotune_config():
     return [
         triton.Config({'B_c': 16, 'B_r': 16, 'd': 128}),
+        triton.Config({'B_c': 16, 'B_r': 8, 'd': 128}),
     ]
 
 @triton.jit 
@@ -39,7 +45,6 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
                             stride_vn: int, stride_vd: int,
                             stride_on: int, stride_od: int,
                             d: tl.constexpr,
-                            T_r: tl.constexpr,
                             B_c: tl.constexpr, 
                             B_r: tl.constexpr,
                             ) -> torch.Tensor:
@@ -58,46 +63,45 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     q_ptrs = q_ptr + (off_r[:, None] * stride_qn + off_d[None, :] * stride_qd)
     o_ptrs = o_ptr + (off_r[:, None] * stride_on + off_d[None, :] * stride_od)
 
-    for i in tl.range(0, T_r):
-        ## 4: load Q_i from HBM to on-chip SRAM
-        q_i = tl.load(q_ptrs)   # q_i   has shape [B_r, d]
+    ## 4: load Q_i from HBM to on-chip SRAM
+    q_i = tl.load(q_ptrs, mask=off_r[:, None] < N, other=0.0)   # q_i   has shape [B_r, d]
 
-        ## 5: on-chip, initialize o_prev_i, l_prev_i, m_prev_i
-        o_prev = tl.zeros((B_r, d), dtype=tl.float32)             # 5: o(0)_i has 0s    of shape [B_r, d]
-        l_prev = tl.zeros((B_r, 1), dtype=tl.float32)             # 5: l(0)_i has 0s    of shape [B_r]
-        m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
+    ## 5: on-chip, initialize o_prev_i, l_prev_i, m_prev_i
+    o_prev = tl.zeros((B_r, d), dtype=tl.float32)             # 5: o(0)_i has 0s    of shape [B_r, d]
+    l_prev = tl.zeros((B_r, 1), dtype=tl.float32)             # 5: l(0)_i has 0s    of shape [B_r]
+    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
+    
+    # online softmax
+    ## 6: for 1 <= j <= T_c do
+    k_ptrs = k_ptr + off_c[:, None] * stride_kn + off_d[None, :] * stride_kd
+    v_ptrs = v_ptr + off_c[:, None] * stride_vn + off_d[None, :] * stride_vd
+    
+    for j in tl.range(0, T_c):
+        k_j = tl.load(k_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load K_j from HBM to on-chip SRAM. K_j has shape [B_c, d]
+        v_j = tl.load(v_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load V_j from HBM to on-chip SRAM. V_j has shape [B_c, d]
+
+        # there is no matmul op in triton
+        s_i = tl.dot(q_i, k_j.T)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
+        m_tilde = tl.max(s_i, axis=-1, keep_dims=True)                   ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
+        m_i = tl.maximum(m_prev, m_tilde)                                               
+        p_i = tl.exp(s_i - m_i)                                          ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
+        ex_m_diff = tl.exp(m_prev - m_i)
         
-        # online softmax
-        ## 6: for 1 <= j <= T_c do
-        k_ptrs = k_ptr + off_c[:, None] * stride_kn + off_d[None, :] * stride_kd
-        v_ptrs = v_ptr + off_c[:, None] * stride_vn + off_d[None, :] * stride_vd
+        l_i = ex_m_diff * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)  ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
+        o_i = ex_m_diff * o_prev + tl.dot(p_i, v_j)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i ) + P(j)_i @ V_j )     }$ of shape [B_r, d]
+
+        m_prev = m_i
+        l_prev = l_i
+        o_prev = o_i
+
+        k_ptrs += B_c * stride_kn
+        v_ptrs += B_c * stride_vn
         
-        for j in tl.range(0, T_c):
-            k_j = tl.load(k_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load K_j from HBM to on-chip SRAM. K_j has shape [B_c, d]
-            v_j = tl.load(v_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load V_j from HBM to on-chip SRAM. V_j has shape [B_c, d]
+    res = o_prev / l_prev      ## 11: On chip, compute O_i = O(j)_i / l(j)_i
+    tl.store(o_ptrs, res)       
 
-            # there is no matmul op in triton
-            s_i = tl.dot(q_i, k_j.T)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
-            m_tilde = tl.max(s_i, axis=1, keep_dims=True)                    ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
-            m_i = tl.maximum(m_prev, m_tilde)                                               
-            p_i = tl.exp(s_i - m_i)                                          ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
-            ex_m_diff = tl.exp(m_prev - m_i)
-          
-            l_i = ex_m_diff * l_prev + tl.sum(p_i, axis=1, keep_dims=True)   ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
-            o_i = ex_m_diff * o_prev + tl.dot(p_i, v_j)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i ) + P(j)_i @ V_j )     }$ of shape [B_r, d]
-
-            m_prev = m_i
-            l_prev = l_i
-            o_prev = o_i
-
-            k_ptrs += B_c * stride_kn
-            v_ptrs += B_c * stride_vn
-            
-        res = o_prev / l_prev      ## 11: On chip, compute O_i = O(j)_i / l(j)_i
-        tl.store(o_ptrs, res)       
-
-        q_ptrs += B_r * stride_qn
-        o_ptrs += B_r * stride_on   
+    # q_ptrs += B_r * stride_qn
+    # o_ptrs += B_r * stride_on   
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     N,d = q.shape
@@ -124,11 +128,20 @@ def main():
     v = torch.randn((seq_len, head_dim), device=DEVICE, dtype=torch.float32)
 
     flash_output = flash_attention(q,k,v)
-    base_output = torch_attention(q,k,v)
+    torch_output = torch_attention(q,k,v)
+    torch_flash_output = torch_flash_attention(q,k,v)
     rtol = 0
-    if torch.allclose(flash_output, base_output, atol=1e-2, rtol=rtol):
+    if torch.allclose(flash_output, torch_output, atol=1e-2, rtol=rtol):
         print("✅ Flash and Base match")
     else:
         print("❌ Flash and Base differ")
+        df = pandas.DataFrame(flash_output.cpu().numpy())
+        df.to_csv('flash.csv')
+        df = pandas.DataFrame(torch_output.cpu().numpy())
+        df.to_csv('torch.csv')
+        df = pandas.DataFrame(torch_flash_output.cpu().numpy())
+        df.to_csv('torch_flash.csv')
+        # torch.save(flash_output, 'flash.pt')
+        # torch.save(base_output, 'base.pt')
 
 main()
