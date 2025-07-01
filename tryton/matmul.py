@@ -115,7 +115,9 @@ def matmul_kernel(
     #        - what computations are done cooperatively? is that a meaningful question to ask at this level of abstraction?
     #            - all computations done using pid can be statically tracked and fused into SIMD)
     #        - what is GROUP_SIZE_M and BLOCK_SIZE_M in this matmul example? rather, why do we have GROUP_SIZE_M?
+    # BLOCKS MUST BE POW_OF_2
 
+    # 1 program_id corresponds to one thread block (ala SPMD)
     pid = tl.program_id(axis=0) # why axis=0, why don't we use the other axes?
                                 # probably cause we're doing split-K
 
@@ -155,7 +157,7 @@ def matmul_kernel(
         max_k = K - k * B_K 
 
         # load tensors
-        # q: are these cooperative loads?
+        # q: are these cooperative loads? a: yes, the size and shape and distribution is done by triton
         # q: another way: what is the total memory put into SRAM with each load?
         #    is it [B_M, B_K]? or is it [B_M, B_K] per pid?
         #    that is, the total elems loaded per thread block is [B_M, B_K] * group_size?

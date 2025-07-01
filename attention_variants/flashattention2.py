@@ -52,7 +52,10 @@ class FlashAttention2(torch.nn.Module):
                 p_i = torch.exp(s_i - m_i)
                 ex_m_diff = torch.exp(m_prev - m_i)
                 l_i = ex_m_diff * l_prev + torch.sum(p_i, dim=-1, keepdim=True)
-                o_i = ex_m_diff * o_prev + p_i @ v_j
+                # quantization of p_i would come in here
+                #   easier to write in pytorch, but writing it this way makes the kernel
+                # p_qi = p_i.to(torch.float16)
+                o_i = ex_m_diff * o_prev + p_qi @ v_j
 
                 m_prev = m_i
                 l_prev = l_i

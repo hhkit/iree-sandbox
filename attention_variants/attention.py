@@ -7,7 +7,13 @@ import iree.runtime as rt
 
 class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(q @ k.T, dim=-1) @ v
+        # return torch.nn.functional.scaled_dot_product_attention(q, k ,v) # this is flash attention
+        s = q @ k.T
+        m, _ = torch.max(s, dim=-1, keepdim=True)
+        sum = torch.sum(torch.exp(m - s))
+        acc = s @ v
+        return acc / sum
+        return torch.softmax(s, dim=-1) @ v                     # this is attention
 
 
 model = Attention()
