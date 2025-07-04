@@ -81,15 +81,14 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     for j in tl.range(0, T_c):
         k_j = tl.load(k_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load K_j from HBM to on-chip SRAM. K_j has shape [B_c, d]
         v_j = tl.load(v_ptrs, mask=off_c[:, None] < N - j * B_c, other=0.0)  ## 7: load V_j from HBM to on-chip SRAM. V_j has shape [B_c, d]
-
-        # there is no matmul op in triton
-        s_i = tl.dot(q_i, k_j.T)                                         ## 8:  On chip, compute S(j)_i = ${ Q_i @ K_j.T                      }$ of shape [B_r, B_c]
-        m_i = tl.maximum(m_prev, tl.max(s_i, axis=-1, keep_dims=True))   ## 9:  On chip, compute m(j)_i = ${ max( m(j-1)_i, rowmax(S(j)_i) )  }$ of shape [B_r]
-        p_i = tl.exp(s_i - m_i)                                          ## 9:  On chip, compute P(j)_i = ${ exp( S(j)_i - m(j)_i )           }$ of shape [B_r, B_c]
+        s_i = tl.dot(q_i, k_j.T)                                             ## 8:  On chip, compute ${ S(j)_i = Q_i @ K_j.T } of shape [B_r, B_c]
+               
+        m_i = tl.maximum(m_prev, tl.max(s_i, axis=-1, keep_dims=True)) ## 9:  On chip, compute ${ m(j)_i = max( m(j-1)_i, rowmax(S(j)_i) )     }$ of shape [B_r]
+        p_i = tl.exp(s_i - m_i)                                        ## 9:  On chip, compute ${ P(j)_i = exp( S(j)_i - m(j)_i )              }$ of shape [B_r, B_c]
         
-        alpha = tl.exp(m_prev - m_i)
-        l_i = alpha * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)  ## 9:  On chip, compute l(j)_i = ${ exp( m(j-1)_i - m(j)_i ) * l(j)_i + rowsum(P(j)_i) }$ of shape [B_r]
-        o_i = tl.dot(p_i, v_j, alpha * o_prev)                      ## 10: On chip, compute O(j)_i = ${ diag(exp( m(j-1)_i - m(j)_i )-1 + P(j)_i @ V_j )     }$ of shape [B_r, d]
+        alpha = tl.exp(m_prev - m_i)                                   ## 9.5:                 ${ alpha_i = exp(m(j-1)_i - m(j)_i) }
+        l_i = alpha * l_prev + tl.sum(p_i, axis=-1, keep_dims=True)    ## 9:  On chip, compute ${ l(j)_i = alpha_i * l(j)_i + rowsum(P(j)_i)   }$ of shape [B_r]
+        o_i = tl.dot(p_i, v_j, o_prev * alpha)                         ## 10: On chip, compute ${ O(j)_i = diag(alpha_i)^(-1) + P(j)_i @ V_j ) }$ of shape [B_r, d]
 
         m_prev = m_i
         l_prev = l_i
@@ -142,12 +141,8 @@ def main():
         to_csv(torch_output, 'torch.csv')
         to_csv(torch_flash_output, 'torch_flash.csv')
 
-        diff = (flash_output - torch_output) / torch_output
-        threshold = 0.1
-        mask = torch.abs(diff) < threshold
-        zeros = torch.zeros_like(diff)
-        zeros[~mask] = diff[~mask]
-        to_csv(zeros, 'diff.csv')
+        torch.testing.assert_close(flash_output, torch_output, atol=1e-2, rtol=rtol)
+        # to_csv(zeros, 'diff.csv')
 
         # torch.save(flash_output, 'flash.pt')
         # torch.save(base_output, 'base.pt')

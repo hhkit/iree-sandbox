@@ -55,7 +55,7 @@ class FlashAttention2(torch.nn.Module):
                 # quantization of p_i would come in here
                 #   easier to write in pytorch, but writing it this way makes the kernel
                 # p_qi = p_i.to(torch.float16)
-                o_i = ex_m_diff * o_prev + p_qi @ v_j
+                o_i = ex_m_diff * o_prev + p_i @ v_j
 
                 m_prev = m_i
                 l_prev = l_i
