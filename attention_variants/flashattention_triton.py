@@ -15,7 +15,7 @@ M = int(262144)
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 def torch_flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.scaled_dot_product_attention(q,k,v)
+    return torch.nn.functional.scaled_dot_product_attention(q,k,v, scale=1.0)
 
 def torch_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.softmax(q @ k.T, dim=-1) @ v
@@ -71,7 +71,7 @@ def flash_attention_kernel( q_ptr: torch.Tensor,
     ## 5: on-chip, initialize o_prev_i, l_prev_i, m_prev_i
     o_prev = tl.zeros((B_r, d), dtype=tl.float32)             # 5: o(0)_i has 0s    of shape [B_r, d]
     l_prev = tl.zeros((B_r, 1), dtype=tl.float32)             # 5: l(0)_i has 0s    of shape [B_r]
-    m_prev = tl.full((B_r, 1), -math.inf, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
+    m_prev = tl.full((B_r, 1), -1e60, dtype=tl.float32)   # 5: m(0)_i has -infs of shape [B_r]
     
     # online softmax
     ## 6: for 1 <= j <= T_c do
@@ -131,6 +131,7 @@ def main():
     torch_output = torch_attention(q,k,v)
     torch_flash_output = torch_flash_attention(q,k,v)
     rtol = 0
+    torch.testing.assert_close(flash_output, torch_output, atol=1e-2, rtol=rtol)
     if torch.allclose(flash_output, torch_output, atol=1e-2, rtol=rtol):
         print("✅ Flash and Base match")
     else:
@@ -141,7 +142,6 @@ def main():
         to_csv(torch_output, 'torch.csv')
         to_csv(torch_flash_output, 'torch_flash.csv')
 
-        torch.testing.assert_close(flash_output, torch_output, atol=1e-2, rtol=rtol)
         # to_csv(zeros, 'diff.csv')
 
         # torch.save(flash_output, 'flash.pt')
